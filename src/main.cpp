@@ -34,6 +34,7 @@ enum class GlobalError : uint16_t {
   UnexpectedEof,
   DanglingEnd,
   InvalidEndDelimiter,
+  LinkingFailed,
 };
 
 struct Location {
@@ -334,13 +335,40 @@ struct Compilation {
     TagMap tags = {};
   };
 
+  struct Note {};
+
   using Instruction = std::variant<Call, Emit, Jump, Ret>;
   using NameMap = std::map<std::string_view, Namespace>;
 
-  NameMap namespaces;
-  FileMap files = {};
-  FileMap local = {};
-  std::vector<Instruction> program = {};
+  NameMap namespaces = {};
+  FileMap files{};
+  FileMap local{};
+  std::vector<Note> notes{};
+  std::vector<Instruction> program{};
+
+  enum class LinkError {
+    Ok = static_cast<uint16_t>(GlobalError::Ok),
+    LinkingFailed = static_cast<uint16_t>(GlobalError::LinkingFailed),
+  };
+
+  [[nodiscard]] auto link() noexcept -> LinkError {
+    for (const auto& ns : this->namespaces) {
+      for (const auto& symbol : ns.second.symbols) {
+        const auto tag = ns.second.tags.find(symbol.first);
+
+        if (tag == ns.second.tags.end()) {
+          this->notes.emplace_back(Note{});
+          continue;
+        }
+
+        for (const auto offset : symbol.second) {
+          std::get<Call>(this->program[offset]).offset = tag->second.offset;
+        }
+      }
+    }
+
+    return this->notes.size() ? LinkError::LinkingFailed : LinkError::Ok;
+  }
 };
 
 struct Parser {
@@ -728,6 +756,11 @@ struct Interpreter {
     uint16_t indent;
   };
 
+  enum class StackError {
+    Ok = static_cast<uint16_t>(GlobalError::Ok),
+    OutOfMemory = static_cast<uint16_t>(GlobalError::OutOfMemory),
+  };
+
   struct Flags {
     int should_indent : 1 = 0;
     int last_is_newline : 1 = 0;
@@ -736,10 +769,11 @@ struct Interpreter {
   enum class Status { running, done };
 
   std::span<Compilation::Instruction> program;
-  std::vector<Frame> stack = {};
   Flags flags = {};
   uint16_t indent = 0;
   Compilation::Offset ip;
+  std::span<Frame> stack;
+  uint16_t sp = 0;
 
   struct RunResult {
     Interface::Error err = Interface::Error::Ok;
@@ -761,7 +795,7 @@ struct Interpreter {
   }
 
   [[nodiscard]] auto ret(Interface& iface) noexcept -> RunResult {
-    if (auto* frame = this->pop()) {
+    if (auto frame = this->pop()) {
       this->ip = frame->ip;
       this->indent = frame->indent;
 
@@ -785,6 +819,8 @@ struct Interpreter {
 
     this->ip = params.offset;
     this->flags.last_is_newline = true;
+
+    return Interface::Error::Ok;
   }
 
   [[nodiscard]] auto call(Compilation::Call params, Interface& iface)
@@ -800,26 +836,36 @@ struct Interpreter {
     }
 
     const auto err = iface.call(params.offset, params.indent);
-    switch (err) {
-      case Interface::Error::Ok:
-        break;
-      default:
-        return err;
-    }
+    if (err != Interface::Error::Ok)
+      return err;
 
     this->indent += params.indent;
     this->ip = params.offset;
 
     this->flags.should_indent = false;
+
+    return Interface::Error::Ok;
+  }
+
+  [[nodiscard]] auto push(const Frame frame) noexcept -> StackError {
+    if (this->sp < this->stack.size()) {
+      this->stack[this->sp] = frame;
+      this->sp += 1;
+      return StackError::Ok;
+    } else {
+      return StackError::OutOfMemory;
+    }
+  }
+
+  [[nodiscard]] auto pop() noexcept -> std::optional<Frame> {
+    if (this->sp != 0) {
+      this->sp -= 1;
+      return this->stack[this->sp];
+    } else {
+      return std::nullopt;
+    }
   }
 };
-
-// std::visit(overloaded{
-//   [](Ret&) { ... },
-//   [](Call&) { ... },
-//   [](Emit&) { ... },
-//   [](Jump&) { ... },
-// }, item)
 
 auto main(int argc, const char** argv) -> int {
   auto fd = open(argv[1], 0);
@@ -847,4 +893,22 @@ auto main(int argc, const char** argv) -> int {
       break;
     }
   }
+
+  Compilation compilation{};
+  if (compilation.link() != Compilation::LinkError::Ok) {
+    for (const auto& note : compilation.notes) {
+      (void)note;  // TODO
+    }
+    return 1;
+  }
+
+  std::array<Interpreter::Frame, 16> buffer;
+
+  Interpreter vm{
+      .program = compilation.program,
+      .ip = 0,
+      .stack = std::span<Interpreter::Frame>(buffer),
+  };
+
+  (void)vm;
 }
