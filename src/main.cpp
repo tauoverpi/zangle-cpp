@@ -175,7 +175,7 @@ struct Tokenizer {
         }  // end start
 
         case State::match: {
-          if (byte != counter) {
+          if (byte != static_cast<char>(counter)) {
             goto tokenizer_end;
           }
 
@@ -220,7 +220,7 @@ struct Tokenizer {
         }  // end skip
 
         case State::maybe_paste: {
-          if (byte == counter) {
+          if (byte == static_cast<char>(counter)) {
             token.tag = Token::Tag::text;
             this->index -= 1;
             goto tokenizer_end;
@@ -260,11 +260,12 @@ struct Tokenizer {
         }  // end maybe_paste
 
         case State::paste: {
-          if (byte != counter) {
+          if (byte != static_cast<char>(counter)) {
             if (this->index - token.start > 1) {
-              const auto offset =
+              const auto offset = static_cast<unsigned long>(
                   delimiters.begin() -
-                  std::ranges::find(delimiters, static_cast<uint8_t>(counter));
+                  std::ranges::find(delimiters, static_cast<uint8_t>(counter)));
+
               if (offset < (delimiters.size() / 2)) {
                 token.tag = Token::Tag::begin;
               } else {
@@ -487,18 +488,31 @@ struct Parser {
                         this->peek().tag != Tokenizer::Token::Tag::text) {
                       const auto block = this->it.text.substr(
                           text_block_begin, text_block_end - 1);
-                      this->emit(block);
+
+                      const auto err = this->emit(block);
+                      if (err != ParseError::Ok)
+                        return err;
+
                       goto parse_loop_end;
                     }
-                    this->ret();
+                    const auto err = this->ret();
+                    if (err != ParseError::Ok)
+                      return err;
                     break;
                   }
 
                   case Tokenizer::Token::Tag::eof: {
                     const auto block =
                         this->it.text.substr(text_block_begin, text_block_end);
-                    this->emit(block);
-                    this->ret();
+
+                    const auto err0 = this->emit(block);
+                    if (err0 != ParseError::Ok)
+                      return err0;
+
+                    const auto err1 = this->ret();
+                    if (err1 != ParseError::Ok)
+                      return err1;
+
                     break;
                   }
 
@@ -524,13 +538,17 @@ struct Parser {
                       if (text_block_begin != text_block_end) {
                         const auto block = this->it.text.substr(
                             text_block_begin, text_block_end);
-                        this->emit(block);
+                        const auto err = this->emit(block);
+                        if (err != ParseError::Ok)
+                          return err;
                       }
 
                       const auto ns =
                           args.nspace == std::nullopt ? nspace : *args.nspace;
 
-                      this->call(indent, args.tag, ns, args.command);
+                      auto err = this->call(indent, args.tag, ns, args.command);
+                      if (err != ParseError::Ok)
+                        return err;
                     }
                     break;
                   }
@@ -556,36 +574,40 @@ struct Parser {
               const Compilation::Offset link =
                   this->compilation.program.size() - 1;
 
-              const auto [space, _] =
-                  this->compilation.namespaces.insert({nspace, {}});
+              try {
+                const auto [space, _] =
+                    this->compilation.namespaces.insert({nspace, {}});
 
-              Compilation::Link* entry;
-              bool found_existing = false;
+                Compilation::Link* entry;
+                bool found_existing = false;
 
-              if (header.tag != std::nullopt) {
-                const auto [val, ok] =
-                    space->second.tags.insert({*header.tag, {}});
-                entry = &val->second;
-                found_existing = !ok;
-              } else if (header.tag != std::nullopt) {
-                const auto [val, ok] =
-                    this->compilation.local.insert({*header.tag, {}});
-                entry = &val->second;
-                found_existing = !ok;
-              } else {
-                assert(false);
-              }
+                if (header.tag != std::nullopt) {
+                  const auto [val, ok] =
+                      space->second.tags.insert({*header.tag, {}});
+                  entry = &val->second;
+                  found_existing = !ok;
+                } else if (header.tag != std::nullopt) {
+                  const auto [val, ok] =
+                      this->compilation.local.insert({*header.tag, {}});
+                  entry = &val->second;
+                  found_existing = !ok;
+                } else {
+                  assert(false);
+                }
 
-              if (found_existing) {
-                this->compilation.program[entry->link] = Compilation::Jump{
-                    .offset = procedure,
-                };
-                entry->link = link;
-              } else {
-                *entry = {
-                    .offset = procedure,
-                    .link = link,
-                };
+                if (found_existing) {
+                  this->compilation.program[entry->link] = Compilation::Jump{
+                      .offset = procedure,
+                  };
+                  entry->link = link;
+                } else {
+                  *entry = {
+                      .offset = procedure,
+                      .link = link,
+                  };
+                }
+              } catch (const std::bad_alloc& e) {
+                return ParseError::OutOfMemory;
               }
 
               break;
@@ -698,30 +720,46 @@ struct Parser {
 
   [[nodiscard]] auto parse_call(const std::string_view text) noexcept -> Call {}
 
-  auto ret() noexcept -> void {
-    this->compilation.program.emplace_back(Compilation::Ret{});
+  [[nodiscard]] auto ret() noexcept -> ParseError {
+    try {
+      this->compilation.program.emplace_back(Compilation::Ret{});
+      return ParseError::Ok;
+    } catch (const std::bad_alloc& e) {
+      return ParseError::OutOfMemory;
+    }
   }
 
-  auto emit(const std::string_view text) noexcept -> void {
-    this->compilation.program.emplace_back(Compilation::Emit{
-        .text = text,
-    });
+  [[nodiscard]] auto emit(const std::string_view text) noexcept -> ParseError {
+    try {
+      this->compilation.program.emplace_back(Compilation::Emit{
+          .text = text,
+      });
+      return ParseError::Ok;
+    } catch (const std::bad_alloc& e) {
+      return ParseError::OutOfMemory;
+    }
   }
 
-  auto call(uint16_t indent,
-            const std::string_view tag,
-            const std::string_view nspace,
-            const std::optional<std::string_view> command) noexcept -> void {
-    const auto [ns, _] = this->compilation.namespaces.insert({nspace, {}});
-    const auto [sym, __] = ns->second.symbols.insert({tag, {}});
+  [[nodiscard]] auto call(
+      uint16_t indent,
+      const std::string_view tag,
+      const std::string_view nspace,
+      const std::optional<std::string_view> command) noexcept -> ParseError {
+    try {
+      const auto [ns, _] = this->compilation.namespaces.insert({nspace, {}});
+      const auto [sym, __] = ns->second.symbols.insert({tag, {}});
 
-    const auto offset = this->compilation.program.size();
-    sym->second.emplace_back(offset);
-    this->compilation.program.emplace_back(Compilation::Call{
-        .indent = indent,
-        .command = command,
-        .offset = 0xffff'ffff,
-    });
+      const auto offset = this->compilation.program.size();
+      sym->second.emplace_back(offset);
+      this->compilation.program.emplace_back(Compilation::Call{
+          .indent = indent,
+          .command = command,
+          .offset = 0xffff'ffff,
+      });
+      return ParseError::Ok;
+    } catch (const std::bad_alloc& e) {
+      return ParseError::OutOfMemory;
+    }
   }
 };
 
@@ -868,6 +906,9 @@ struct Interpreter {
 };
 
 auto main(int argc, const char** argv) -> int {
+  if (argc != 2) {
+    return 2;  // TODO: handle cli arguments properly
+  }
   auto fd = open(argv[1], 0);
   defer _(nullptr, [fd](...) { close(fd); });
 
