@@ -1,0 +1,13 @@
+CompileFlags:
+  Add: [-std=c++2b, -Wall]
+  Compiler: z++
+Diagnostics:
+  ClangTidy:
+    Add: modernize*
+Diagnostics:
+  UnusedIncludes: Strict
+InlayHints:
+  Designators: Yes
+  Enabled: Yes
+  ParameterNames: Yes
+  DeducedTypes: Yes
